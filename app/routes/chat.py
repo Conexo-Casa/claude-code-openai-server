@@ -32,6 +32,7 @@ from app.events import AssistantToolUse, Error, TextDelta, TurnDone
 from app.openai_models import ChatCompletionRequest
 from app.textfilter import OutputFilter
 from app.timing import TurnTimer
+from app.session_reuse import MODE_RESUME
 from app.translate import (
     DONE,
     completion_response,
@@ -45,6 +46,7 @@ from app.translate import (
     sse,
     text_chunk,
     tool_calls_chunk,
+    turn_delta,
     usage_from_turn,
 )
 
@@ -57,6 +59,8 @@ _SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+
+
 
 
 @router.post("/v1/chat/completions")
@@ -76,9 +80,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     # ── autonomous path (no external tools) ────────────────────────────────
     convo, system = split_system(req.messages)
-    content = fold_conversation(convo)
+
+    # Phase 3: decide seed / resume / legacy for this fresh turn. On resume we
+    # send ONLY the new user turn (the CLI already holds the prior context on
+    # disk); otherwise we fold the whole transcript as before.
+    registry = request.app.state.session_registry
+    plan = registry.plan(req.hermes_session_id, workdir, enabled=settings.session_reuse)
+    if plan.mode == MODE_RESUME:
+        content = turn_delta(convo)
+    else:
+        content = fold_conversation(convo)
     if not content or (isinstance(content, str) and not content.strip()):
         raise OpenAIError("no user content in messages", status_code=400, param="messages")
+    if plan.mode != "legacy":
+        logger.info("autonomous turn: reuse mode=%s session=%s", plan.mode, plan.session_uuid)
 
     timing = settings.timing_log
     sess = ClaudeSession(
@@ -90,6 +105,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         enable_tool_search=settings.enable_tool_search,
         timing_log=timing,
         timing_label="autonomous",
+        resume_session_id=plan.resume_id,
+        assign_session_id=plan.assign_id,
         **_prompt_kwargs(settings, system),
     )
     await sess.start()
