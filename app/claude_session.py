@@ -81,6 +81,8 @@ class ClaudeSession:
         env: Optional[dict[str, str]] = None,
         timing_log: bool = False,
         timing_label: str = "session",
+        resume_session_id: Optional[str] = None,
+        assign_session_id: Optional[str] = None,
     ) -> None:
         self.claude_bin = claude_bin
         self.model = model
@@ -89,6 +91,12 @@ class ClaudeSession:
         self.effort = effort
         self.mcp_config = mcp_config
         self.allowed_tools = allowed_tools
+        # Phase 3 session reuse (mutually exclusive): --resume <id> resumes an
+        # existing on-disk session (send only the new turn); --session-id <id>
+        # starts a new session under a caller-chosen id (seed with history).
+        # Both default None => today's stateless fresh-spawn behavior.
+        self.resume_session_id = resume_session_id
+        self.assign_session_id = assign_session_id
         self.append_system_prompt = append_system_prompt
         # When set, REPLACES claude's default (Claude Code) system prompt via
         # --system-prompt, instead of layering on top via --append-system-prompt.
@@ -129,6 +137,12 @@ class ClaudeSession:
             "--permission-mode", self.permission_mode,
             "--add-dir", self.workdir,
         ]
+        # Phase 3: resume an existing session, or assign our own id to a new one.
+        # These are mutually exclusive; resume wins if both are somehow set.
+        if self.resume_session_id:
+            args += ["--resume", self.resume_session_id]
+        elif self.assign_session_id:
+            args += ["--session-id", self.assign_session_id]
         if self.effort:
             args += ["--effort", self.effort]
         if self.mcp_config is not None:

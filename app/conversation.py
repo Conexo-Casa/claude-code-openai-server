@@ -36,7 +36,14 @@ from app.config import Settings
 from app.events import AssistantToolUse, Error, TextDelta, TurnDone
 from app.mcp_bridge import ConversationBridge, McpBridge, PendingCall
 from app.openai_models import ChatCompletionRequest, ChatMessage
-from app.translate import fold_conversation, message_text, split_system, usage_from_turn
+from app.session_reuse import MODE_LEGACY, MODE_RESUME, SessionRegistry
+from app.translate import (
+    fold_conversation,
+    message_text,
+    split_system,
+    turn_delta,
+    usage_from_turn,
+)
 from app.warmpool import Signature, WarmPool, tools_signature
 
 logger = logging.getLogger("cci.conv")
@@ -102,9 +109,18 @@ class ExpiredContinuation(Exception):
 
 
 class ConversationManager:
-    def __init__(self, mcp: McpBridge, settings: Settings) -> None:
+    def __init__(
+        self,
+        mcp: McpBridge,
+        settings: Settings,
+        registry: Optional[SessionRegistry] = None,
+    ) -> None:
         self.mcp = mcp
         self.settings = settings
+        # Phase 3 session-reuse registry (seed vs. resume bookkeeping). Shared
+        # with the autonomous path via app.state; a private one is created when
+        # not supplied (keeps existing test call sites working).
+        self.registry = registry if registry is not None else SessionRegistry()
         self._conversations: dict[str, Conversation] = {}
         self._pending_index: dict[str, str] = {}  # tool_call_id -> conv_id
         self._lock = asyncio.Lock()
@@ -157,14 +173,23 @@ class ConversationManager:
         effort: Optional[str],
     ) -> Conversation:
         convo, system = split_system(req.messages)
-        content = fold_conversation(convo)
+
+        # ── Phase 3: seed / resume / legacy decision ──────────────────────—
+        # On resume, send ONLY the new user turn (the CLI holds prior context on
+        # disk); otherwise fold the whole transcript as before. A real session
+        # id (seed/resume) bypasses the warm pool — a generic pre-spawned proc
+        # cannot carry our --session-id/--resume.
+        plan = self.registry.plan(
+            req.hermes_session_id, workdir, enabled=self.settings.session_reuse
+        )
+        content = turn_delta(convo) if plan.mode == MODE_RESUME else fold_conversation(convo)
 
         # ── warm-pool fast path ───────────────────────────────────────────—
         # On a signature match, the proc is already spawned (and warm): late-bind
         # the request's tools onto its pre-registered bridge BEFORE the first user
         # turn (list_tools is only consulted after the turn starts, so the schema
         # is correct), then send the turn. No spawn, no register.
-        if self.pool is not None:
+        if self.pool is not None and plan.mode == MODE_LEGACY:
             sig = Signature(
                 model=model, effort=effort, workdir=str(workdir), system=system,
                 tools_key=tools_signature(req.tools),
@@ -205,13 +230,16 @@ class ConversationManager:
             enable_tool_search=self.settings.enable_tool_search,
             timing_log=self.settings.timing_log,
             timing_label="tool",
+            resume_session_id=plan.resume_id,
+            assign_session_id=plan.assign_id,
             **_prompt_kwargs(self.settings, system),
         )
         await session.start()
         conv = Conversation(conv_id=conv_id, session=session, bridge=bridge, model=model)
         async with self._lock:
             self._conversations[conv_id] = conv
-        logger.info("conv=%s created (model=%s, %d tools)", conv_id, model, len(req.tools or []))
+        logger.info("conv=%s created (model=%s, %d tools, reuse=%s session=%s)",
+                    conv_id, model, len(req.tools or []), plan.mode, plan.session_uuid)
         await session.send_user_turn(content)
         return conv
 

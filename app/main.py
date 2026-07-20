@@ -22,6 +22,7 @@ from app.conversation import ConversationManager
 from app.errors import OpenAIError
 from app.mcp_bridge import McpBridge
 from app.routes import chat, compat, health, models
+from app.session_reuse import SessionRegistry
 
 logger = logging.getLogger("cci")
 
@@ -40,7 +41,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     mcp: McpBridge = app.state.mcp
     async with mcp.lifespan():
-        manager = ConversationManager(mcp, settings)
+        # Phase 3: one session-reuse registry shared by the autonomous and tool
+        # paths (seed vs. resume bookkeeping keyed by the derived session UUID).
+        registry: SessionRegistry = app.state.session_registry
+        manager = ConversationManager(mcp, settings, registry)
         app.state.conv_manager = manager
         gc_task = asyncio.create_task(manager.gc_loop(), name="cci-gc")
         if manager.pool is not None:
@@ -76,6 +80,9 @@ def create_app() -> FastAPI:
     app = FastAPI(title="claude-code-interface", lifespan=lifespan)
     app.state.settings = settings
     app.state.mcp = mcp
+    # Session-reuse registry (Phase 3). Created at app build so both the lifespan
+    # (ConversationManager) and the autonomous route share one instance.
+    app.state.session_registry = SessionRegistry()
 
     @app.exception_handler(OpenAIError)
     async def _openai_error_handler(_: Request, exc: OpenAIError):  # type: ignore[unused-ignore]

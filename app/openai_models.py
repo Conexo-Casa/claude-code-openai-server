@@ -83,6 +83,11 @@ class ChatCompletionRequest(BaseModel):
     # Non-standard CCI extensions:
     workdir: Optional[str] = None
     effort: Optional[str] = None
+    # Stable per-conversation id from hermes (Phase 3 cross-turn session reuse).
+    # When present and CCI_SESSION_REUSE is on, the server derives a Claude
+    # session UUID from it to --resume the conversation instead of re-folding the
+    # whole transcript. Ignored when the feature is off. See app/session_reuse.py.
+    hermes_session_id: Optional[str] = None
 
 
 # ── Response (non-streaming) ──────────────────────────────────────────────—

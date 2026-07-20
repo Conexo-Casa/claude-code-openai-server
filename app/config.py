@@ -101,6 +101,19 @@ class Settings(BaseSettings):
     # an empty bridge whose tools are late-bound on acquire. See app/warmpool.py.
     warm_pool_size: int = 0
 
+    # ── Cross-turn session reuse (Phase 3) ─────────────────────────────────—
+    # When true, a fresh turn carrying hermes' stable ``hermes_session_id`` is
+    # mapped to a deterministic Claude session UUID: the first turn seeds it with
+    # ``--session-id`` and later turns ``--resume`` it, sending only the new user
+    # turn instead of re-folding the whole transcript. This lets the CLI read the
+    # prior context from its on-disk store as prompt-cache hits rather than
+    # re-prefilling it every turn. Ships dark (off) — with it off, or when a
+    # request carries no ``hermes_session_id``, behavior is byte-for-byte the
+    # legacy fold-everything path. See app/session_reuse.py. Preserves the
+    # subscription-auth invariant: every turn still spawns the CLI, which reads
+    # the OAuth credential; no API key is ever introduced.
+    session_reuse: bool = False
+
     @field_validator("default_workdir", mode="before")
     @classmethod
     def _expand_workdir(cls, v: object) -> object:

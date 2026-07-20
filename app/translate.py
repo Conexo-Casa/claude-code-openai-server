@@ -161,6 +161,20 @@ def fold_conversation(convo: list[ChatMessage]) -> str | list[dict[str, Any]]:
     return message_text(last)
 
 
+def turn_delta(convo: list[ChatMessage]) -> str | list[dict[str, Any]]:
+    """The trailing user turn's content only — for a ``--resume`` spawn that
+    already holds the prior context on disk (Phase 3).
+
+    Preserves multimodal (image) content via :func:`_claude_message_content`.
+    Falls back to :func:`fold_conversation` when the trailing message is not a
+    plain user message; on a fresh (non-continuation) turn the last message is
+    always the new user turn, so the fast path is the norm.
+    """
+    if convo and convo[-1].role == "user":
+        return _claude_message_content(convo[-1])
+    return fold_conversation(convo)
+
+
 # ── stop_reason / usage mapping ────────────────────────────────────────────—
 
 
