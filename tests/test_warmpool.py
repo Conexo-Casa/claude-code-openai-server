@@ -54,9 +54,14 @@ def _patch_session(monkeypatch):
 def make_settings(**over):
     from app.config import Settings
 
+    # Warm-pool adoption is a legacy-path (Phase 2) behavior: a Phase-3 seed/
+    # resume needs --session-id/--resume, which a generic pooled proc cannot
+    # carry, so create() bypasses the pool whenever reuse is active. Pin reuse
+    # OFF here so these tests are deterministic regardless of an ambient
+    # CCI_SESSION_REUSE in the environment (Settings reads CCI_-prefixed env).
     base = dict(suspended_ttl_s=300, idle_session_ttl_s=900, gc_interval_s=30,
                 request_timeout_s=30, permission_mode="bypassPermissions", port=8799,
-                default_model="claude-opus-4-8")
+                default_model="claude-opus-4-8", session_reuse=False)
     base.update(over)
     return Settings(**base)
 

@@ -81,3 +81,70 @@ a long-lived process would carry does not apply — no lifetime cap needed.
 
 Ship dark. Enable `CCI_SESSION_REUSE=true` on the systemd unit after the Hermes emit-patch lands
 and one supervised session confirms cache_read reuse in the live logs. Rollback = unset the flag.
+
+---
+
+## Addendum (2026-07-20) — content-fingerprint fallback for surfaces with no `hermes_session_id`
+
+### Why
+
+Live activation exposed a gap the original keying assumed away. The `hermes_session_id`
+fast-lane requires Hermes to attach the id on the wire. It does for the gateway/CLI agent
+paths — but the **WebUI** reaches the model through a separate multi-hop path
+(`hermes-webui` → runtime_adapter → runner_client → runner → `AIAgent`), and on the deployed
+June build `agent.session_id` is **not** threaded onto the model call there. Result: the wrapper
+received `hermes_session_id=None` and every turn logged `reuse=legacy` even with the flag on and
+the emit-patch live. (Also uncovered en route: the deployment's provider is named
+`claude-code-server`, not the literal `custom`, so the Hermes-side guard had to match the real
+provider name. Fixed in the maintained host-patch overlay, tracked in the ops repo.)
+
+Chasing the id across the WebUI's internal hops would be fragile (separate `/opt/hermes-webui`
+code tree, uncertain durability across updates) and would only fix one surface.
+
+### Design — key on the conversation itself when no id is present
+
+The server already receives the full conversation every turn (stateless OpenAI endpoint), so it
+can derive its own stable key. Preference order, in `SessionRegistry.plan()`:
+
+1. **`hermes_session_id`** when present — unchanged fast lane, unique per conversation, no guard.
+2. **Content anchor** otherwise — `uuid5(NAMESPACE, "cci-content:" + first_user_message_text)`.
+   The first user message is byte-stable across every turn of a linear conversation and is
+   independent of any per-turn drift in the system prompt, so keying on it (rather than
+   `system + first_user`) is drift-proof — it cannot silently lose reuse if Hermes varies the
+   system block. Mirrors Hermes' own `_derive_chat_session_id` (`api-<digest>`) for OpenAI-compat
+   frontends.
+
+**Divergence guard (makes the fallback safe).** Two *different* conversations that open with the
+byte-identical first line derive the same key. To never merge them:
+- Opening turn (history length 1): if the derived session is already seeded, treat it as a
+  different conversation and fall back to `legacy` (a throwaway fold — for one message, just that
+  message). We cannot yet tell two identical opens apart, so we never resume into the other one.
+- Continuing turn: fingerprint the first assistant reply (message index 1) at seed time and
+  re-check it on every resume. On mismatch, a different conversation has collided on the anchor →
+  fall back to `legacy` instead of resuming. Net: correctness is always preserved; the cache win
+  goes to the first conversation with a given opening line, and any collider runs exactly like
+  today. (Relevant here because this user often opens chats with short generic lines like
+  "status".)
+
+Compaction still re-seeds cleanly on both lanes: hsid rotates on `_compress_context`; the content
+anchor changes when Hermes rewrites the leading messages.
+
+### Verification (content lane, no `hermes_session_id` on the wire)
+
+- Unit: `tests/test_session_reuse.py` now 20 tests (seed→resume across turns, opening-turn
+  collision → legacy, divergence-guard → legacy, disk-backfill resume, hsid-preferred-over-content).
+  Full suite **115 passing**, green both with and without an ambient `CCI_SESSION_REUSE` in the env
+  (warm-pool adoption tests pin `session_reuse=False`, since a Phase-3 seed/resume correctly
+  bypasses the generic warm pool).
+- E2E, throwaway server on :8801, flag ON, **no `hermes_session_id` sent**, isolated workdir,
+  production :8787 untouched:
+  - Turn 1 → `reuse[content]: seed`; Turn 2 (same first user message) → `reuse[content]: resume`.
+  - Turn 2's delta did **not** restate the planted secret; the answer recalled it correctly
+    (`ZEPHYR-2291`) — proof the session resumed and read prior context back from cache.
+  - Cost $0.898 → $0.0438 (~20×) on the subscription path (`cost_usd` reported, no API key).
+
+### Files changed (addendum)
+
+- `app/session_reuse.py` — content anchor + divergence-guard registry; `plan()` now takes `convo`.
+- `app/routes/chat.py`, `app/conversation.py` — pass `convo` into `plan()`; log `key_source`.
+- `tests/test_session_reuse.py` — content-lane coverage; `tests/test_warmpool.py` — pin reuse off.

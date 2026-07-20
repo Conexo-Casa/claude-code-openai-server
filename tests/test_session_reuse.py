@@ -3,15 +3,39 @@
 from __future__ import annotations
 
 import app.session_reuse as sr
+from app.openai_models import ChatMessage
 from app.session_reuse import (
+    KEY_CONTENT,
+    KEY_HSID,
     MODE_LEGACY,
     MODE_RESUME,
     MODE_SEED,
     ReusePlan,
     SessionRegistry,
+    content_anchor,
+    derive_content_session_uuid,
     derive_session_uuid,
     project_dir_for,
 )
+
+
+# ── message-list builders (content-lane fixtures) ───────────────────────────
+
+
+def _u(text):
+    return ChatMessage(role="user", content=text)
+
+
+def _a(text):
+    return ChatMessage(role="assistant", content=text)
+
+
+def _turn(*texts):
+    """Build a conversation from alternating user/assistant texts."""
+    msgs = []
+    for i, t in enumerate(texts):
+        msgs.append(_u(t) if i % 2 == 0 else _a(t))
+    return msgs
 
 
 # ── uuid derivation ─────────────────────────────────────────────────────────
@@ -58,13 +82,13 @@ def test_reuse_plan_id_properties():
 
 def test_disabled_is_legacy():
     reg = SessionRegistry()
-    plan = reg.plan("hsid", "/tmp/wd", enabled=False)
+    plan = reg.plan("hsid", [_u("hi")], "/tmp/wd", enabled=False)
     assert plan.mode == MODE_LEGACY and plan.session_uuid is None
 
 
-def test_missing_id_is_legacy():
+def test_missing_id_and_no_convo_is_legacy():
     reg = SessionRegistry()
-    plan = reg.plan(None, "/tmp/wd", enabled=True)
+    plan = reg.plan(None, [], "/tmp/wd", enabled=True)
     assert plan.mode == MODE_LEGACY
 
 
@@ -72,11 +96,11 @@ def test_first_contact_seeds_then_resumes(monkeypatch):
     # No on-disk session anywhere.
     monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
     reg = SessionRegistry()
-    first = reg.plan("hsid-1", "/tmp/wd", enabled=True)
-    assert first.mode == MODE_SEED
+    first = reg.plan("hsid-1", [_u("hi")], "/tmp/wd", enabled=True)
+    assert first.mode == MODE_SEED and first.key_source == KEY_HSID
     assert first.session_uuid == derive_session_uuid("hsid-1")
     # Same conversation again → resume (now in the seen-set).
-    second = reg.plan("hsid-1", "/tmp/wd", enabled=True)
+    second = reg.plan("hsid-1", [_u("hi")], "/tmp/wd", enabled=True)
     assert second.mode == MODE_RESUME
     assert second.session_uuid == first.session_uuid
 
@@ -86,27 +110,100 @@ def test_disk_backfill_resumes_after_restart(monkeypatch):
     # resume without re-seeding.
     monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: True)
     reg = SessionRegistry()
-    plan = reg.plan("hsid-restart", "/tmp/wd", enabled=True)
+    plan = reg.plan("hsid-restart", [_u("hi")], "/tmp/wd", enabled=True)
     assert plan.mode == MODE_RESUME
 
 
 def test_forget_forces_reseed(monkeypatch):
     monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
     reg = SessionRegistry()
-    p1 = reg.plan("hsid-x", "/tmp/wd", enabled=True)
+    p1 = reg.plan("hsid-x", [_u("hi")], "/tmp/wd", enabled=True)
     assert p1.mode == MODE_SEED
     reg.forget(p1.session_uuid)
     # After forget, disk still says no → seed again (not resume a nonexistent).
-    p2 = reg.plan("hsid-x", "/tmp/wd", enabled=True)
+    p2 = reg.plan("hsid-x", [_u("hi")], "/tmp/wd", enabled=True)
     assert p2.mode == MODE_SEED
 
 
 def test_distinct_conversations_get_distinct_sessions(monkeypatch):
     monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
     reg = SessionRegistry()
-    a = reg.plan("conv-a", "/tmp/wd", enabled=True)
-    b = reg.plan("conv-b", "/tmp/wd", enabled=True)
+    a = reg.plan("conv-a", [_u("hi")], "/tmp/wd", enabled=True)
+    b = reg.plan("conv-b", [_u("hi")], "/tmp/wd", enabled=True)
     assert a.session_uuid != b.session_uuid
+
+
+# ── content lane (no hermes_session_id on the wire) ─────────────────────────
+
+
+def test_content_anchor_is_first_user_text():
+    assert content_anchor([_u("  Hello there  "), _a("hi")]) == "Hello there"
+    # Empty / non-user leading message → no anchor.
+    assert content_anchor([]) is None
+    assert content_anchor([_a("assistant first")]) is None
+    assert content_anchor([_u("   ")]) is None
+
+
+def test_content_seed_then_resume_across_turns(monkeypatch):
+    # WebUI-style path: no hsid, so keying falls to content. First message is
+    # byte-stable across turns, so turn 2+ resumes the seeded session.
+    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
+    reg = SessionRegistry()
+    t1 = reg.plan(None, [_u("start the task")], "/tmp/wd", enabled=True)
+    assert t1.mode == MODE_SEED and t1.key_source == KEY_CONTENT
+    assert t1.session_uuid == derive_content_session_uuid("start the task")
+    # Turn 2 (first reply present) → resume, guard captured.
+    t2 = reg.plan(None, _turn("start the task", "ok", "next"), "/tmp/wd", enabled=True)
+    assert t2.mode == MODE_RESUME and t2.session_uuid == t1.session_uuid
+    # Turn 3, same first reply → still resume.
+    t3 = reg.plan(None, _turn("start the task", "ok", "next", "more", "again"),
+                  "/tmp/wd", enabled=True)
+    assert t3.mode == MODE_RESUME and t3.session_uuid == t1.session_uuid
+
+
+def test_content_opening_turn_collision_is_legacy(monkeypatch):
+    # A *different* conversation opens with the identical first line while the
+    # first is already seeded → must NOT resume into it.
+    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
+    reg = SessionRegistry()
+    a1 = reg.plan(None, [_u("status")], "/tmp/wd", enabled=True)
+    assert a1.mode == MODE_SEED
+    # Second chat, same opening line, single message → ambiguous → legacy.
+    b1 = reg.plan(None, [_u("status")], "/tmp/wd", enabled=True)
+    assert b1.mode == MODE_LEGACY
+
+
+def test_content_divergence_guard_blocks_merge(monkeypatch):
+    # Two chats share the opening line but diverge at the first reply → the
+    # second must fall back to legacy, never resume into the first's session.
+    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
+    reg = SessionRegistry()
+    # Chat A seeds, then establishes its guard (first reply "AAA").
+    reg.plan(None, [_u("status")], "/tmp/wd", enabled=True)
+    a2 = reg.plan(None, _turn("status", "AAA", "go on"), "/tmp/wd", enabled=True)
+    assert a2.mode == MODE_RESUME
+    # Chat B, same opening line but a different first reply ("BBB") → collision.
+    b2 = reg.plan(None, _turn("status", "BBB", "go on"), "/tmp/wd", enabled=True)
+    assert b2.mode == MODE_LEGACY
+
+
+def test_content_disk_backfill_resumes_after_restart(monkeypatch):
+    # Fresh registry (post-restart), continuing turn, session file on disk →
+    # resume on the content lane without re-seeding.
+    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: True)
+    reg = SessionRegistry()
+    plan = reg.plan(None, _turn("resume me", "ok", "again"), "/tmp/wd", enabled=True)
+    assert plan.mode == MODE_RESUME and plan.key_source == KEY_CONTENT
+
+
+def test_hsid_preferred_over_content(monkeypatch):
+    # When both an hsid and content are available, the hsid fast lane wins and
+    # keys on the hsid (not the content anchor).
+    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
+    reg = SessionRegistry()
+    p = reg.plan("the-hsid", [_u("some opening")], "/tmp/wd", enabled=True)
+    assert p.key_source == KEY_HSID
+    assert p.session_uuid == derive_session_uuid("the-hsid")
 
 
 # ── ClaudeSession arg wiring ────────────────────────────────────────────────

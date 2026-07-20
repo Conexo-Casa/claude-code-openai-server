@@ -180,7 +180,7 @@ class ConversationManager:
         # id (seed/resume) bypasses the warm pool — a generic pre-spawned proc
         # cannot carry our --session-id/--resume.
         plan = self.registry.plan(
-            req.hermes_session_id, workdir, enabled=self.settings.session_reuse
+            req.hermes_session_id, convo, workdir, enabled=self.settings.session_reuse
         )
         content = turn_delta(convo) if plan.mode == MODE_RESUME else fold_conversation(convo)
 
@@ -238,8 +238,9 @@ class ConversationManager:
         conv = Conversation(conv_id=conv_id, session=session, bridge=bridge, model=model)
         async with self._lock:
             self._conversations[conv_id] = conv
-        logger.info("conv=%s created (model=%s, %d tools, reuse=%s session=%s)",
-                    conv_id, model, len(req.tools or []), plan.mode, plan.session_uuid)
+        logger.info("conv=%s created (model=%s, %d tools, reuse=%s src=%s session=%s)",
+                    conv_id, model, len(req.tools or []),
+                    plan.mode, plan.key_source, plan.session_uuid)
         await session.send_user_turn(content)
         return conv
 
