@@ -32,7 +32,7 @@ from app.events import AssistantToolUse, Error, TextDelta, TurnDone
 from app.openai_models import ChatCompletionRequest
 from app.textfilter import OutputFilter
 from app.timing import TurnTimer
-from app.session_reuse import MODE_RESUME
+from app.session_reuse import MODE_LEGACY, MODE_RESUME
 from app.translate import (
     DONE,
     completion_response,
@@ -85,15 +85,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # send ONLY the new user turn (the CLI already holds the prior context on
     # disk); otherwise we fold the whole transcript as before.
     registry = request.app.state.session_registry
-    plan = registry.plan(req.hermes_session_id, workdir, enabled=settings.session_reuse)
+    plan = registry.plan(req.hermes_session_id, convo, workdir, enabled=settings.session_reuse)
     if plan.mode == MODE_RESUME:
         content = turn_delta(convo)
     else:
         content = fold_conversation(convo)
     if not content or (isinstance(content, str) and not content.strip()):
         raise OpenAIError("no user content in messages", status_code=400, param="messages")
-    if plan.mode != "legacy":
-        logger.info("autonomous turn: reuse mode=%s session=%s", plan.mode, plan.session_uuid)
+    if plan.mode != MODE_LEGACY:
+        logger.info("autonomous turn: reuse mode=%s src=%s session=%s",
+                    plan.mode, plan.key_source, plan.session_uuid)
 
     timing = settings.timing_log
     sess = ClaudeSession(
