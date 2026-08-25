@@ -126,7 +126,8 @@ class WarmPool:
         # Mirror ConversationManager._mcp_url: built from settings.port so the
         # URL the pooled claude dials self-matches whatever port we run on.
         prefix = self.settings.mcp_path_prefix.rstrip("/")
-        return f"http://127.0.0.1:{self.settings.port}{prefix}/{conv_id}"
+        return (f"http://{self.settings.mcp_dial_host()}:"
+                f"{self.settings.port}{prefix}/{conv_id}")
 
     def _next_conv_id(self) -> str:
         self._counter += 1

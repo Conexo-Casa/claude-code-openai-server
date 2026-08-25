@@ -1,0 +1,50 @@
+[Unit]
+Description=Claude Code OpenAI Server
+After=network.target docker.service
+
+# Belongs in [Unit]. It sat in [Service] in the previous unit, where systemd
+# silently ignored it ("Unknown key"), so the default rate limit (5 starts / 10s)
+# was quietly in force despite Restart=always. Setting it here actually takes
+# effect: the service will keep retrying indefinitely instead of giving up after
+# a burst of failures.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=behlers
+WorkingDirectory=/opt/containers/claude-code-openai-server
+
+# HOME stays in the unit rather than the env file: it is process context, not app
+# config, and it is what makes the subscription OAuth credential
+# (~/.claude/.credentials.json) resolvable. Keeping it here means a bad env file
+# cannot silently redirect which credential the spawned `claude` reads -- the
+# no-API-key invariant depends on that path being right.
+Environment=HOME=/home/behlers
+
+# Single source of truth for this service's configuration, matching the
+# /opt/containers/env convention used by the container stacks. systemd reads this
+# as root at unit start, before dropping to User=behlers, so 0640 is sufficient.
+#
+# Deliberately NOT written as `-EnvironmentFile=`: if this file is missing or
+# unreadable the unit MUST fail. An unset CCI_HOST would expand the ExecStart
+# below to `--host `, which resolves to 0.0.0.0 -- publishing a
+# permission_mode=bypassPermissions API on eth0's public IP with no
+# bearer token. Failing to start is the only acceptable behaviour there.
+EnvironmentFile=/opt/containers/env/claude-code-openai-server.env
+
+ExecStart=/opt/containers/claude-code-openai-server/.venv/bin/python -m uvicorn app.main:app --host ${CCI_HOST} --port 8787
+
+Restart=always
+RestartSec=10
+
+# This limit covers the WHOLE cgroup: uvicorn plus every `claude` subprocess it
+# spawns. It must stay in step with CCI_MAX_CONCURRENT_CONVERSATIONS in the env
+# file, since that cap decides how many children can exist:
+#   8 lanes x ~292 MB anon + ~75 MB uvicorn + ~58 MB slab = ~2.5 GB
+# 3G leaves ~600 MB for page cache. The previous 1500M held only ~4 lanes of
+# anonymous memory, so the cap of 12 could never have been reached -- the cgroup
+# would have OOM-killed first.
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target
