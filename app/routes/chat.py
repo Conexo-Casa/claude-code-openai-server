@@ -96,6 +96,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         logger.info("autonomous turn: reuse mode=%s src=%s session=%s",
                     plan.mode, plan.key_source, plan.session_uuid)
 
+    # Both spawn paths share one ceiling. An autonomous turn holds its slot for
+    # the life of the request — the session is request-scoped and closed in the
+    # _stream / _collect finally, which is also where the slot goes back.
+    mgr: ConversationManager = request.app.state.conv_manager
+    reserved = await mgr.acquire_slot()
+    release = mgr.release_slot if reserved else None
+
     timing = settings.timing_log
     sess = ClaudeSession(
         claude_bin=settings.claude_bin,
@@ -110,8 +117,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         assign_session_id=plan.assign_id,
         **_prompt_kwargs(settings, system),
     )
-    await sess.start()
-    await sess.send_user_turn(content)
+    try:
+        await sess.start()
+        await sess.send_user_turn(content)
+    except BaseException:
+        # Neither _stream nor _collect will run, so their finally cannot free
+        # this slot. Do it here or the ceiling leaks one lane per failed spawn.
+        await sess.aclose()
+        if release is not None:
+            await release()
+        raise
 
     cid = new_completion_id()
     created = now()
@@ -120,17 +135,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     flatten = settings.flatten_markdown_tables
     if req.stream:
         return StreamingResponse(
-            _stream(sess, cid, model, created, timeout, flatten, timing),
+            _stream(sess, cid, model, created, timeout, flatten, timing, release),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
-    body = await _collect(sess, cid, model, created, timeout, flatten, timing)
+    body = await _collect(sess, cid, model, created, timeout, flatten, timing, release)
     return JSONResponse(content=body)
 
 
 async def _stream(
     sess: ClaudeSession, cid: str, model: str, created: int, timeout: float,
-    flatten_tables: bool = True, timing: bool = False,
+    flatten_tables: bool = True, timing: bool = False, on_close=None,
 ) -> AsyncIterator[str]:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -188,11 +203,13 @@ async def _stream(
     finally:
         timer.done(completion_tokens)
         await sess.aclose()
+        if on_close is not None:
+            await on_close()
 
 
 async def _collect(
     sess: ClaudeSession, cid: str, model: str, created: int, timeout: float,
-    flatten_tables: bool = True, timing: bool = False,
+    flatten_tables: bool = True, timing: bool = False, on_close=None,
 ) -> dict:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -240,6 +257,8 @@ async def _collect(
     finally:
         timer.done(completion_tokens)
         await sess.aclose()
+        if on_close is not None:
+            await on_close()
 
 
 # ── tool-passthrough path ───────────────────────────────────────────────────

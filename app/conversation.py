@@ -33,6 +33,7 @@ from typing import Optional, Union
 
 from app.claude_session import STREAM_CLOSED, ClaudeSession, prompt_session_kwargs as _prompt_kwargs
 from app.config import Settings
+from app.errors import OpenAIError
 from app.events import AssistantToolUse, Error, TextDelta, TurnDone
 from app.mcp_bridge import ConversationBridge, McpBridge, PendingCall
 from app.openai_models import ChatCompletionRequest, ChatMessage
@@ -125,6 +126,10 @@ class ConversationManager:
         self._pending_index: dict[str, str] = {}  # tool_call_id -> conv_id
         self._lock = asyncio.Lock()
         self._counter = 0
+        # Slots claimed by spawns that have not yet registered in
+        # _conversations. Counted alongside live conversations so the ceiling
+        # holds during the seconds session.start() takes.
+        self._reserved = 0
         # Warm subprocess pool (Phase 2). None unless CCI_WARM_POOL_SIZE > 0, so
         # it ships dark. Lifespan owns its start/stop (see app/main.lifespan).
         self.pool: Optional[WarmPool] = (
@@ -162,9 +167,80 @@ class ConversationManager:
 
     def _mcp_url(self, conv_id: str) -> str:
         prefix = self.settings.mcp_path_prefix.rstrip("/")
-        return f"http://127.0.0.1:{self.settings.port}{prefix}/{conv_id}"
+        return (f"http://{self.settings.mcp_dial_host()}:"
+                f"{self.settings.port}{prefix}/{conv_id}")
+
+    async def acquire_slot(self) -> bool:
+        """Claim one concurrency slot, or raise 429 when the server is full.
+
+        Shared by both spawn paths: ConversationManager.create() for tool
+        turns, and the autonomous route for tool-less ones. Returns True when a
+        slot was reserved and must later be released, False when the cap is off. Reserving under the same lock that guards
+        _conversations is what makes the ceiling hold: spawning is slow, so a
+        bare len() check would let every concurrent caller past the gate before
+        the first one registers.
+        """
+        cap = self.settings.max_concurrent_conversations
+        if cap <= 0:
+            return False
+        async with self._lock:
+            in_flight = len(self._conversations) + self._reserved
+            if in_flight >= cap:
+                logger.warning(
+                    "at capacity: %d live + %d spawning >= cap %d; refusing turn",
+                    len(self._conversations), self._reserved, cap,
+                )
+                raise OpenAIError(
+                    f"server at capacity: {cap} concurrent conversations already "
+                    "active; retry in a moment",
+                    status_code=429,
+                    type="rate_limit_error",
+                    code="max_concurrent_conversations",
+                )
+            self._reserved += 1
+        return True
+
+    def lane_usage(self) -> dict[str, int]:
+        """Live lanes, in-flight spawns, and the ceiling — for /healthz.
+
+        Lock-free on purpose: both numbers are plain ints and a torn read is at
+        worst off by one in a status payload, which is not worth contending the
+        lock that every spawn and teardown already needs.
+        """
+        return {
+            "live": len(self._conversations),
+            "spawning": self._reserved,
+            "cap": self.settings.max_concurrent_conversations,
+        }
+
+    async def release_slot(self) -> None:
+        async with self._lock:
+            self._reserved = max(0, self._reserved - 1)
 
     async def create(
+        self,
+        req: ChatCompletionRequest,
+        *,
+        model: str,
+        workdir: Path,
+        effort: Optional[str],
+    ) -> Conversation:
+        """Spawn a conversation, subject to the concurrency ceiling.
+
+        The slot is held only while the spawn is in flight; once the
+        conversation is registered in _conversations it is counted there
+        instead, so the two never disagree about how many lanes exist.
+        """
+        reserved = await self.acquire_slot()
+        try:
+            return await self._create_inner(
+                req, model=model, workdir=workdir, effort=effort
+            )
+        finally:
+            if reserved:
+                await self.release_slot()
+
+    async def _create_inner(
         self,
         req: ChatCompletionRequest,
         *,

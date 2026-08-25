@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     idle_session_ttl_s: int = 900
     gc_interval_s: int = 30
 
+    # ── Concurrency ceiling ────────────────────────────────────────────────—
+    # Hard cap on live conversations. Each one owns a `claude` CLI subprocess
+    # holding ~300 MB RSS, and without a ceiling the only limit is physical RAM:
+    # on a 7.7 GB host with ~1.8 GB committed elsewhere, ~19 lanes exhaust memory
+    # and the OOM killer takes the whole server rather than one request. 12 keeps
+    # ~2.4 GB headroom while sitting well clear of observed peak use (7 lanes
+    # during one interactive session). Turns beyond the cap get an OpenAI-shaped
+    # 429 and may retry; continuations of an already-live conversation are never
+    # refused, since they reuse a subprocess rather than spawning one. 0 disables.
+    max_concurrent_conversations: int = 12
+
     # ── Logging ────────────────────────────────────────────────────────────—
     log_level: str = "INFO"
     # When true, emit per-turn latency metrics (spawn_ms / ttft_ms / total_ms /
@@ -125,6 +136,20 @@ class Settings(BaseSettings):
         """True when the bind host only accepts connections from this machine."""
         h = self.host.strip().lower()
         return h in {"localhost", "::1", "0:0:0:0:0:0:0:1"} or h.startswith("127.")
+
+    def mcp_dial_host(self) -> str:
+        """Host the spawned ``claude`` dials to reach our per-conversation MCP
+        endpoint. This must be an address we actually bound: hardcoding loopback
+        breaks every session when the server is bound to a specific non-loopback
+        address (e.g. the docker bridge IP) — the dial is refused, the "hermes"
+        MCP server fails to load, and --strict-mcp-config then leaves the child
+        with no hermes tools at all. A wildcard bind is the one case where
+        loopback is the right dial target.
+        """
+        h = self.host.strip()
+        if h in {"0.0.0.0", "::", "*", ""}:
+            return "127.0.0.1"
+        return h
 
     def resolved_workdir_roots(self) -> list[Path]:
         """The set of allowed workspace roots as resolved absolute paths."""
