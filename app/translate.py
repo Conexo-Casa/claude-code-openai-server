@@ -71,7 +71,12 @@ def _claude_message_content(msg: ChatMessage) -> str | list[dict[str, Any]]:
         if not isinstance(part, dict):
             continue
         if part.get("type") == "text" and isinstance(part.get("text"), str):
-            blocks.append({"type": "text", "text": part["text"]})
+            # Skip empties: the API rejects {"type":"text","text":""}, so an
+            # empty text part sitting next to an image would fail the whole
+            # turn. Dropping it matches the string path, which contributes
+            # nothing for an empty part either.
+            if part["text"]:
+                blocks.append({"type": "text", "text": part["text"]})
             continue
         if part.get("type") != "image_url":
             continue
@@ -120,18 +125,68 @@ def _role_label(role: str) -> str:
     return {"user": "User", "assistant": "Assistant", "tool": "Tool"}.get(role, role.capitalize())
 
 
+def _history_images(msg: ChatMessage) -> list[dict[str, Any]]:
+    """Image blocks carried by a message, or ``[]``.
+
+    Goes through :func:`_claude_message_content` so an image folded from history
+    is validated exactly like one on the live turn (data-URL shape, media type,
+    size cap, base64).
+    """
+    content = _claude_message_content(msg)
+    if not isinstance(content, list):
+        return []
+    return [b for b in content if b.get("type") == "image"]
+
+
+def _render_items(items: list[Any]) -> str | list[dict[str, Any]]:
+    """Render fold items — labelled lines and image blocks — for the wire.
+
+    An all-text fold collapses back to one newline-joined string, the exact
+    shape this server has always sent, so a conversation without images is
+    byte-identical to before. As soon as an image is in play the fold becomes a
+    content-block list instead, with each run of lines merged into a single text
+    block so every image keeps its position in the transcript.
+    """
+    if not any(isinstance(it, dict) for it in items):
+        return "\n".join(items)
+
+    blocks: list[dict[str, Any]] = []
+    run: list[str] = []
+    for it in items:
+        if isinstance(it, dict):
+            if run:
+                blocks.append({"type": "text", "text": "\n".join(run)})
+                run = []
+            blocks.append(it)
+        else:
+            run.append(it)
+    if run:
+        blocks.append({"type": "text", "text": "\n".join(run)})
+    return blocks
+
+
 def fold_conversation(convo: list[ChatMessage]) -> str | list[dict[str, Any]]:
     """Fold a (system-stripped) OpenAI conversation into one Claude user turn.
 
     A lone trailing user message is sent as-is. Otherwise prior turns become a
     transcript preamble so a fresh, stateless subprocess still has the context.
+
+    Images in those prior turns are carried through as content blocks in place,
+    so a refold does not blind the model to a picture it was already shown — a
+    follow-up like "what colour was the shirt?" used to be answered from the
+    text alone, confidently and with nothing in the logs. A conversation
+    without images folds to exactly the same string as before.
+
+    This path matters more than it looks: every MODE_LEGACY turn folds, and the
+    content lane now goes legacy for the rest of a conversation after a restart
+    (see app.session_reuse).
     """
     if not convo:
         return ""
     if len(convo) == 1 and convo[0].role == "user":
         return _claude_message_content(convo[0])
 
-    lines: list[str] = []
+    items: list[Any] = []
     for m in convo[:-1]:
         text = message_text(m)
         if m.tool_calls:
@@ -139,25 +194,33 @@ def fold_conversation(convo: list[ChatMessage]) -> str | list[dict[str, Any]]:
                 f"{tc.function.name}({tc.function.arguments or ''})" for tc in m.tool_calls
             )
             text = (text + " " if text else "") + f"[called tools: {calls}]"
+        images = _history_images(m)
         if text:
-            lines.append(f"{_role_label(m.role)}: {text}")
+            items.append(f"{_role_label(m.role)}: {text}")
+        elif images:
+            # An image-only turn still needs its label, so the blocks that
+            # follow are attributed to the right speaker.
+            items.append(f"{_role_label(m.role)}:")
+        items.extend(images)
+
     last = convo[-1]
     last_content = _claude_message_content(last)
+
     if isinstance(last_content, list):
-        if lines:
-            return [{
-                "type": "text",
-                "text": "Conversation so far:\n" + "\n".join(lines) + f"\n\n{_role_label(last.role)}:",
-            }, *last_content]
+        if items:
+            preamble = _render_items(
+                ["Conversation so far:", *items, "", f"{_role_label(last.role)}:"]
+            )
+            if isinstance(preamble, str):
+                return [{"type": "text", "text": preamble}, *last_content]
+            return [*preamble, *last_content]
         return last_content
+
     last_line = f"{_role_label(last.role)}: {last_content}"
-    if lines:
-        return (
-            "Conversation so far:\n"
-            + "\n".join(lines)
-            + "\n\n"
-            + last_line
-        )
+    if items:
+        # The trailing "" reproduces the historical "\n\n" seam before the live
+        # turn, so a text-only fold is byte-identical to the previous output.
+        return _render_items(["Conversation so far:", *items, "", last_line])
     return message_text(last)
 
 
