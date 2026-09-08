@@ -91,8 +91,30 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def _auth(request: Request, call_next):
         # When an api_key is configured, every /v1 request must carry a matching
-        # bearer token. The MCP mount is intentionally exempt: it is reached only
-        # by the local Claude subprocess over loopback and carries no token.
+        # bearer token. The MCP mount is intentionally exempt, and the exemption
+        # is a deliberate accepted risk rather than a safety property:
+        #
+        # The original justification here ("reached only by the local Claude
+        # subprocess over loopback") is NOT true of every deployment. Bound to a
+        # docker-bridge address, /mcp is reachable by anything else on that
+        # bridge. Measured peer addresses for legitimate traffic vary by client
+        # context (container 172.26.0.250, host curl 2.24.205.37, the CLI itself
+        # 172.26.0.1), so a peer-address allowlist is not a usable gate either —
+        # it would reject the CLI and, under --strict-mcp-config, silently leave
+        # the child with no hermes tools at all.
+        #
+        # What protects /mcp instead is the conversation id: uuid4 entropy makes
+        # the per-conversation URL an unguessable capability (see
+        # ConversationManager._next_conv_id). That is weaker than a token — the
+        # id appears in logs and in the child's argv, readable via ps by any
+        # local user — and requiring a bearer token here was considered and
+        # declined on 2026-09-08, since the CLI's ability to send headers to an
+        # http MCP server is unverified. Revisit if /mcp ever needs to be
+        # reachable across a trust boundary.
+        #
+        # Do NOT "fix" this by gating /mcp on the /v1 key without first proving
+        # the spawned CLI can carry the header: the failure mode is silent tool
+        # loss, not an error.
         key = settings.api_key
         if key and request.url.path.startswith("/v1"):
             header = request.headers.get("authorization", "")
