@@ -187,13 +187,22 @@ def test_content_divergence_guard_blocks_merge(monkeypatch):
     assert b2.mode == MODE_LEGACY
 
 
-def test_content_disk_backfill_resumes_after_restart(monkeypatch):
-    # Fresh registry (post-restart), continuing turn, session file on disk →
-    # resume on the content lane without re-seeding.
+def test_content_disk_backfill_does_not_resume_after_restart(monkeypatch):
+    # Policy reversal, 2026-09-08. This previously asserted MODE_RESUME: a fresh
+    # registry (post-restart) with a session file on disk resumed on the content
+    # lane. That was a blind merge — the divergence guard lives only in
+    # `_sessions` and is never persisted, so an on-disk file proves a transcript
+    # exists but not whose it is. Two conversations sharing an opening message
+    # derive the same UUID, and the second one inherited the first's history.
+    #
+    # The content lane now falls back to legacy instead, accepting the loss of
+    # restart-survival. See test_disk_backfill_policy.py for the full contract;
+    # the hsid lane (unique key, no collision) still resumes from disk.
     monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: True)
     reg = SessionRegistry()
     plan = reg.plan(None, _turn("resume me", "ok", "again"), "/tmp/wd", enabled=True)
-    assert plan.mode == MODE_RESUME and plan.key_source == KEY_CONTENT
+    assert plan.mode == MODE_LEGACY
+    assert plan.resume_id is None
 
 
 def test_hsid_preferred_over_content(monkeypatch):

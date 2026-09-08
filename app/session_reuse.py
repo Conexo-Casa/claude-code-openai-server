@@ -256,9 +256,21 @@ class SessionRegistry:
 
     ``_sessions`` maps a seeded session UUID → its content divergence guard (the
     first-assistant-reply fingerprint, or ``None`` for the hsid lane / not yet
-    captured). Membership is authoritative within a process; across a restart it
-    is empty and the on-disk session file backfills the resume decision, which is
-    what makes reuse survive a wrapper restart.
+    captured). Membership is authoritative within a process, and the guard lives
+    **only** in this dict — it is never persisted.
+
+    That is why the **content lane does not survive a restart**: with
+    ``_sessions`` empty, an on-disk session file proves a transcript exists but
+    not whose it is, so resuming into it would be a blind merge between two
+    conversations that happen to share an opening message. Such turns fall back
+    to :data:`MODE_LEGACY` for the remainder of the conversation (each turn
+    re-probes disk, finds the file, and folds again). Correctness over cache
+    hits — decided 2026-09-08.
+
+    The **hsid lane is unaffected**: ``hermes_session_id`` is unique per
+    conversation, so there is nothing to collide and no guard is needed. A
+    client that threads a session id therefore keeps reuse across restarts,
+    which is the real fix for the cost this policy accepts.
     """
 
     def __init__(self) -> None:
@@ -334,12 +346,29 @@ class SessionRegistry:
 
         # Continuing turn (history has a first reply to fingerprint).
         if not known:
-            # Not seen this process. On disk (post-restart) → resume; else the
-            # session was never established here → seed (folds full history).
-            self._sessions[session_uuid] = guard
             if session_exists_on_disk(session_uuid, workdir):
-                logger.info("reuse[content]: disk-backfill resume %s", session_uuid)
-                return ReusePlan(MODE_RESUME, session_uuid, KEY_CONTENT)
+                # A session file exists that THIS process never seeded, so its
+                # divergence guard was never captured and is not persisted
+                # anywhere — we cannot tell whether that transcript belongs to
+                # this conversation or to a different one that merely opened
+                # with the same first message. Resuming would have been a blind
+                # merge, so we never do it (policy decision, 2026-09-08).
+                #
+                # Legacy, not seed: MODE_SEED spawns with `--session-id <uuid>`,
+                # and that UUID already has a file on disk. Legacy is also what
+                # the opening-turn branch above already does for exactly this
+                # situation, so the two agree.
+                #
+                # Deliberately do NOT record the guard here. Storing it would
+                # make the next turn take the `known` path with `stored ==
+                # guard` and resume into this very session, reintroducing the
+                # blind merge one turn later.
+                logger.info(
+                    "reuse[content]: unverifiable on-disk session %s → legacy",
+                    session_uuid,
+                )
+                return ReusePlan(mode=MODE_LEGACY)
+            self._sessions[session_uuid] = guard
             logger.info("reuse[content]: seed (mid-history) %s", session_uuid)
             return ReusePlan(MODE_SEED, session_uuid, KEY_CONTENT)
 
