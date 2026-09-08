@@ -193,9 +193,19 @@ class ClaudeSession:
                 limit=_READ_LIMIT,
             )
         except FileNotFoundError as e:
-            raise RuntimeError(
-                "claude CLI not found on PATH — install Claude Code and run `claude login`"
-            ) from e
+            # ENOENT from create_subprocess_exec has two causes: the binary is
+            # not on PATH, or `cwd` does not exist. Blaming PATH unconditionally
+            # sends you looking for an installation problem when the workdir is
+            # what is missing. CPython puts the path that actually failed in
+            # .filename, so report that one.
+            missing = e.filename or self.claude_bin
+            hint = (
+                f"workdir {missing!r} does not exist"
+                if str(missing) == str(self.workdir)
+                else f"claude CLI {missing!r} not found on PATH — "
+                     "install Claude Code and run `claude login`"
+            )
+            raise RuntimeError(f"cannot spawn claude: {hint}") from e
         log_spawn(self.timing_log, self.timing_label, (time.monotonic() - spawn_t0) * 1000)
         self._reader_task = asyncio.create_task(self._read_stdout(), name="claude-stdout")
         self._stderr_task = asyncio.create_task(self._read_stderr(), name="claude-stderr")
