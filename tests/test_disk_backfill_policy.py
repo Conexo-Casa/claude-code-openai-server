@@ -94,16 +94,43 @@ def test_no_disk_file_still_seeds(monkeypatch):
 # ── the in-process path is unchanged ───────────────────────────────────────
 
 def test_same_process_seed_then_resume_still_works(monkeypatch):
-    """The normal (no-restart) lifecycle must keep its cache win."""
-    _force_on_disk(monkeypatch, False)
+    """The normal (no-restart) lifecycle must keep its cache win.
+
+    The transcript is added to the fake disk after the seed, because that is
+    what the CLI does — it writes at spawn, not at exit.
+    """
+    files: set[str] = set()
+    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: u in files)
     reg = SessionRegistry()
 
     opening = reg.plan(None, [u("hello there")], WORKDIR, enabled=True)
     assert opening.mode == MODE_SEED
+    files.add(opening.session_uuid)
 
     following = reg.plan(None, convo(), WORKDIR, enabled=True)
     assert following.mode == MODE_RESUME, "in-process reuse regressed"
     assert following.session_uuid == opening.session_uuid
+
+
+def test_tracked_session_with_no_transcript_is_reseeded(monkeypatch):
+    """A vanished transcript must re-seed, not resume into nothing.
+
+    `claude --resume <gone-uuid>` answers "No conversation found" and produces
+    no output, which renders as an empty-but-successful response — and without
+    dropping the entry it repeats on every later turn.
+    """
+    files: set[str] = set()
+    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: u in files)
+    reg = SessionRegistry()
+
+    opening = reg.plan(None, [u("hello there")], WORKDIR, enabled=True)
+    files.add(opening.session_uuid)
+    assert reg.plan(None, convo(), WORKDIR, enabled=True).mode == MODE_RESUME
+
+    files.discard(opening.session_uuid)  # transcript deleted / rotated away
+    recovered = reg.plan(None, convo(), WORKDIR, enabled=True)
+    assert recovered.mode == MODE_SEED, "resumed into a missing transcript"
+    assert recovered.session_uuid == opening.session_uuid
 
 
 # ── the hsid lane keeps resuming across restarts ───────────────────────────

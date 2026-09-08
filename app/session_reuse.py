@@ -311,6 +311,44 @@ class SessionRegistry:
         if session_uuid in self._sessions:
             self._sessions.move_to_end(session_uuid)
 
+    def _resume_tracked(
+        self,
+        session_uuid: str,
+        workdir: Union[str, Path],
+        *,
+        guard: Optional[str],
+        key_source: str,
+    ) -> ReusePlan:
+        """Resume a tracked session — unless its transcript has disappeared.
+
+        A tracked UUID whose session file is gone (deleted, or rotated by the
+        CLI) is a stale entry, and resuming it is worse than a cache miss:
+        ``claude --resume <uuid>`` prints "No conversation found with session
+        ID: <uuid>" and produces no answer, which reaches us as an immediate
+        STREAM_CLOSED and renders as an EMPTY but *successful* response. Nothing
+        dropped the entry, so every later turn repeated it — the conversation
+        stayed broken with no error anywhere. This is what :meth:`forget` was
+        written for.
+
+        Safe to gate on disk state because the CLI writes the transcript at
+        spawn, not at exit: measured in production, a seed logged at 19:55:26
+        had its file on disk at 19:55:27 (2026-09-08). Turns are seconds apart
+        at minimum, so a live session's file is always present by the next turn.
+        Were that ever untrue the failure would be a re-seed — a full fold,
+        correct but uncached — never a wrong answer.
+        """
+        if not session_exists_on_disk(session_uuid, workdir):
+            logger.warning(
+                "reuse[%s]: tracked session %s has no transcript on disk "
+                "(stale) → forget + re-seed", key_source, session_uuid,
+            )
+            self.forget(session_uuid)
+            self._remember(session_uuid, guard)
+            return ReusePlan(MODE_SEED, session_uuid, key_source)
+        self._touch(session_uuid)
+        logger.info("reuse[%s]: resume %s", key_source, session_uuid)
+        return ReusePlan(MODE_RESUME, session_uuid, key_source)
+
     def plan(
         self,
         hermes_session_id: Optional[str],
@@ -350,9 +388,9 @@ class SessionRegistry:
         # (unlike the content lane, see _plan_content).
         if session_uuid in self._sessions:
             self._sessions.setdefault(session_uuid, None)
-            self._touch(session_uuid)
-            logger.info("reuse[hsid]: resume %s", session_uuid)
-            return ReusePlan(MODE_RESUME, session_uuid, KEY_HSID)
+            return self._resume_tracked(
+                session_uuid, workdir, guard=None, key_source=KEY_HSID
+            )
         if session_exists_on_disk(session_uuid, workdir):
             self._remember(session_uuid, None)
             logger.info("reuse[hsid]: resume %s", session_uuid)
@@ -419,12 +457,13 @@ class SessionRegistry:
         if stored is None:
             # First continuing turn after seeding: capture the guard, resume.
             self._remember(session_uuid, guard)
-            logger.info("reuse[content]: resume (guard captured) %s", session_uuid)
-            return ReusePlan(MODE_RESUME, session_uuid, KEY_CONTENT)
+            return self._resume_tracked(
+                session_uuid, workdir, guard=guard, key_source=KEY_CONTENT
+            )
         if stored == guard:
-            self._touch(session_uuid)
-            logger.info("reuse[content]: resume %s", session_uuid)
-            return ReusePlan(MODE_RESUME, session_uuid, KEY_CONTENT)
+            return self._resume_tracked(
+                session_uuid, workdir, guard=guard, key_source=KEY_CONTENT
+            )
 
         # Divergence: a different conversation shares this opening line. Never
         # merge — fall back to a safe full fold in a throwaway subprocess.

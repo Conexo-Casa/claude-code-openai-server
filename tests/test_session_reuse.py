@@ -92,13 +92,30 @@ def test_missing_id_and_no_convo_is_legacy():
     assert plan.mode == MODE_LEGACY
 
 
+def _seeded_disk(monkeypatch, initial=()):
+    """Fake ``session_exists_on_disk`` backed by a mutable set of UUIDs.
+
+    Returns the set so a test can add a UUID after seeding it — which is what
+    reality does: the CLI writes the transcript at spawn, not at exit (measured
+    in production, a seed logged at 19:55:26 had its file on disk at 19:55:27).
+
+    A permanently-empty fake would model a state that never occurs: a tracked
+    session with no transcript. `_resume_tracked` treats exactly that as a stale
+    entry and re-seeds, so tests using a blanket `lambda: False` were asserting
+    a resume that the real code has no reason to perform.
+    """
+    files = set(initial)
+    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: u in files)
+    return files
+
+
 def test_first_contact_seeds_then_resumes(monkeypatch):
-    # No on-disk session anywhere.
-    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
+    files = _seeded_disk(monkeypatch)
     reg = SessionRegistry()
     first = reg.plan("hsid-1", [_u("hi")], "/tmp/wd", enabled=True)
     assert first.mode == MODE_SEED and first.key_source == KEY_HSID
     assert first.session_uuid == derive_session_uuid("hsid-1")
+    files.add(first.session_uuid)  # the CLI has now written the transcript
     # Same conversation again → resume (now in the seen-set).
     second = reg.plan("hsid-1", [_u("hi")], "/tmp/wd", enabled=True)
     assert second.mode == MODE_RESUME
@@ -147,11 +164,12 @@ def test_content_anchor_is_first_user_text():
 def test_content_seed_then_resume_across_turns(monkeypatch):
     # WebUI-style path: no hsid, so keying falls to content. First message is
     # byte-stable across turns, so turn 2+ resumes the seeded session.
-    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
+    files = _seeded_disk(monkeypatch)
     reg = SessionRegistry()
     t1 = reg.plan(None, [_u("start the task")], "/tmp/wd", enabled=True)
     assert t1.mode == MODE_SEED and t1.key_source == KEY_CONTENT
     assert t1.session_uuid == derive_content_session_uuid("start the task")
+    files.add(t1.session_uuid)  # transcript written at spawn
     # Turn 2 (first reply present) → resume, guard captured.
     t2 = reg.plan(None, _turn("start the task", "ok", "next"), "/tmp/wd", enabled=True)
     assert t2.mode == MODE_RESUME and t2.session_uuid == t1.session_uuid
@@ -176,10 +194,11 @@ def test_content_opening_turn_collision_is_legacy(monkeypatch):
 def test_content_divergence_guard_blocks_merge(monkeypatch):
     # Two chats share the opening line but diverge at the first reply → the
     # second must fall back to legacy, never resume into the first's session.
-    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: False)
+    files = _seeded_disk(monkeypatch)
     reg = SessionRegistry()
     # Chat A seeds, then establishes its guard (first reply "AAA").
-    reg.plan(None, [_u("status")], "/tmp/wd", enabled=True)
+    a1 = reg.plan(None, [_u("status")], "/tmp/wd", enabled=True)
+    files.add(a1.session_uuid)  # transcript written at spawn
     a2 = reg.plan(None, _turn("status", "AAA", "go on"), "/tmp/wd", enabled=True)
     assert a2.mode == MODE_RESUME
     # Chat B, same opening line but a different first reply ("BBB") → collision.

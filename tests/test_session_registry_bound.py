@@ -132,10 +132,13 @@ def test_eviction_without_transcript_reseeds(monkeypatch):
 # ── the bound does not disturb normal operation ────────────────────────────
 
 def test_in_process_seed_then_resume_still_works_under_the_cap(monkeypatch):
-    _no_disk(monkeypatch)
+    # Transcript appears once seeded, as the CLI actually behaves.
+    files: set[str] = set()
+    monkeypatch.setattr(sr, "session_exists_on_disk", lambda u, w: u in files)
     reg = SessionRegistry(max_tracked=64)
     opening = reg.plan("hsid-normal", [u("hello")], WORKDIR, enabled=True)
     assert opening.mode == MODE_SEED
+    files.add(opening.session_uuid)
     follow = reg.plan("hsid-normal", [u("hello"), a("hi"), u("more")], WORKDIR, enabled=True)
     assert follow.mode == MODE_RESUME
     assert follow.session_uuid == opening.session_uuid
