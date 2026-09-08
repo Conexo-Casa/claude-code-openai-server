@@ -61,6 +61,7 @@ anchor and likewise re-seeds. Either way divergence re-seeds; it never merges.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -68,7 +69,6 @@ from pathlib import Path
 from typing import Optional, Union
 
 from app.openai_models import ChatMessage
-from app.translate import message_text
 
 logger = logging.getLogger("cci.reuse")
 
@@ -85,6 +85,13 @@ MODE_LEGACY = "legacy"  # reuse disabled / no key / collision: fold-everything p
 # Key provenance (for logging / diagnostics).
 KEY_HSID = "hsid"
 KEY_CONTENT = "content"
+
+# Separator between an anchor's text section and its non-text digest. ASCII unit
+# separator: it does not occur in prose, so the fast path in `_anchor_repr`
+# (which must stay byte-compatible with the pre-fix anchor) covers essentially
+# all real text. Text that *does* contain it is routed through the structured
+# form so the marker cannot be forged — see `_anchor_repr`.
+SEP = "\x1f"
 
 
 def derive_session_uuid(hermes_session_id: str) -> str:
@@ -105,22 +112,83 @@ def _normalize(text: str) -> str:
     return (text or "").strip()
 
 
+def _anchor_repr(msg: ChatMessage) -> str:
+    """Anchor representation of one message, covering NON-TEXT parts too.
+
+    ``message_text`` deliberately drops non-text content parts (its docstring
+    says so), which made this key blind to images: two different conversations
+    opening with the same sentence and *different* attached images produced a
+    byte-identical anchor, hence the same ``uuid5`` session UUID — and the
+    content lane would resume one into the other's history.
+
+    Backward compatibility is deliberate and load-bearing. For string content,
+    and for a parts list that is entirely text, this returns exactly what the
+    old ``_normalize(message_text(...))`` returned, so every session already on
+    disk keeps its key and no live conversation loses reuse. Only messages that
+    actually carry a non-text part get a new key — precisely the case that was
+    broken.
+
+    Non-text parts are folded into a short digest rather than embedded verbatim:
+    a data-URL image can be megabytes, and this runs on every turn.
+    ``sort_keys`` makes the digest independent of dict ordering.
+    """
+    content = msg.content
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return _normalize(content)
+
+    texts: list[str] = []
+    others: list[object] = []
+    for part in content:
+        if isinstance(part, str):
+            texts.append(part)
+        elif isinstance(part, dict) and part.get("type") == "text" \
+                and isinstance(part.get("text"), str):
+            texts.append(part["text"])
+        else:
+            others.append(part)
+
+    text = _normalize("".join(texts))
+    # Fast path: pure text with no separator byte returns exactly what the
+    # pre-fix anchor did, so on-disk sessions keep their key.
+    if not others and SEP not in text:
+        return text
+
+    # Text that itself contains SEP is routed through the structured form even
+    # with no non-text parts. Otherwise a message whose text is literally
+    # "hello<SEP>nontext:<digest>" would render byte-identical to the anchor of
+    # a *different* conversation that really carries that image — a forgeable
+    # key. Falling through appends the empty-parts digest, which no genuine
+    # image can produce, so the two can never coincide.
+    digest = hashlib.sha256(
+        json.dumps(others, sort_keys=True, separators=(",", ":"), default=str)
+        .encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{text}{SEP}nontext:{digest}"
+
+
 def content_anchor(convo: list[ChatMessage]) -> Optional[str]:
-    """Stable per-conversation anchor: the first user message's normalized text.
+    """Stable per-conversation anchor: the first user message's content.
 
     Returns ``None`` when there is no usable anchor (empty conversation, a
-    non-user leading message, or an empty/image-only first message) — the caller
-    then falls back to :data:`MODE_LEGACY`.
+    non-user leading message, or a first message with no content at all) — the
+    caller then falls back to :data:`MODE_LEGACY`.
 
     The first user message is chosen deliberately: in a linear append-only
     conversation it never changes across turns, and it does not depend on the
     system prompt (which hermes may vary per turn), so keying on it is drift-proof
     where keying on ``system + first user`` would silently lose reuse whenever the
     system prompt drifts.
+
+    Note a deliberate behaviour change: an *image-only* first message used to
+    flatten to ``""`` and fall back to legacy. It now yields a real anchor (the
+    non-text digest), so such conversations get reuse like any other — and,
+    unlike before, two different image-only openings no longer collide.
     """
     if not convo or convo[0].role != "user":
         return None
-    return _normalize(message_text(convo[0])) or None
+    return _anchor_repr(convo[0]) or None
 
 
 def _guard_fp(convo: list[ChatMessage]) -> Optional[str]:
@@ -128,9 +196,17 @@ def _guard_fp(convo: list[ChatMessage]) -> Optional[str]:
 
     Used only on the content lane to detect two different conversations that
     collided on the same opening line — they diverge at the first reply.
+
+    Uses :func:`_anchor_repr` rather than ``message_text`` for the same reason
+    the anchor does: a fingerprint that ignores non-text parts cannot detect
+    divergence that lives entirely in them. For text replies (the normal case
+    for an assistant turn) the two produce identical bytes, so existing guards
+    still match and no live session is invalidated.
     """
     if len(convo) >= 2:
-        return hashlib.sha256(_normalize(message_text(convo[1])).encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(
+            _anchor_repr(convo[1]).encode("utf-8")
+        ).hexdigest()[:16]
     return None
 
 
