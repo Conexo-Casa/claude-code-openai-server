@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -162,8 +163,16 @@ class ConversationManager:
     # ── creation (fresh turn) ─────────────────────────────────────────────—
 
     def _next_conv_id(self) -> str:
+        # The counter keeps ids readable in logs; the uuid4 suffix makes them
+        # unguessable. `/mcp/<conv_id>` routes purely on this id and carries no
+        # bearer token (the auth middleware gates only `/v1`), so the id IS the
+        # access-control boundary — a guessable one lets anything that can reach
+        # our bind address enumerate a live conversation, list the client's tool
+        # schemas, and inject call_tool results the model never emitted. We bind
+        # a docker-bridge address shared with the rest of the estate, so "only
+        # the local subprocess dials this" is not an access guarantee here.
         self._counter += 1
-        return f"conv{self._counter}-{int(time.time())}"
+        return f"conv{self._counter}-{uuid.uuid4().hex}"
 
     def _mcp_url(self, conv_id: str) -> str:
         prefix = self.settings.mcp_path_prefix.rstrip("/")
