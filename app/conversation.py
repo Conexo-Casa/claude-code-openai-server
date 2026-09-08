@@ -381,17 +381,35 @@ class ConversationManager:
     # ── turn loop ─────────────────────────────────────────────────────────—
 
     async def run_turn(self, conv: Conversation) -> AsyncIterator[TurnChunk]:
+        """Drive one turn, yielding chunks for the route to render.
+
+        **Cleanup runs BEFORE the terminal chunk is yielded, never after.** Both
+        consumers in ``routes/chat.py`` leave the ``async for`` the moment they
+        see a terminal chunk — ``_tool_stream`` ``break``s, ``_tool_collect``
+        ``return``s or ``raise``s — so this generator is never resumed past a
+        terminal ``yield``. Anything placed after one runs only when the
+        abandoned async generator is finalized, which is GC-scheduled and
+        arbitrarily later. Since :meth:`_close` releases the concurrency lane and
+        reaps the ``claude`` subprocess (~300 MB), deferring it means completed
+        turns keep holding both — which exhausts
+        ``CCI_MAX_CONCURRENT_CONVERSATIONS`` under traffic that is never more
+        than one turn deep.
+
+        The one branch that must NOT close is the ``ToolCallsChunk`` park: the
+        subprocess is deliberately left blocked in ``call_tool`` awaiting results
+        from the next request.
+        """
         timeout = self.settings.request_timeout_s
         try:
             while True:
                 ev = await conv.session.next_event(timeout=timeout)
                 if ev is None:
-                    yield ErrorChunk("upstream timeout", status_code=504)
                     await self._close(conv)
+                    yield ErrorChunk("upstream timeout", status_code=504)
                     return
                 if ev is STREAM_CLOSED:
-                    yield DoneChunk("stop", {})
                     await self._close(conv)
+                    yield DoneChunk("stop", {})
                     return
                 if isinstance(ev, TextDelta):
                     yield TextChunk(ev.text)
@@ -407,8 +425,8 @@ class ConversationManager:
                         continue
                     batch = await conv.bridge.collect_batch(len(hermes))
                     if not batch:
-                        yield ErrorChunk("expected hermes tool calls did not arrive", status_code=502)
                         await self._close(conv)
+                        yield ErrorChunk("expected hermes tool calls did not arrive", status_code=502)
                         return
                     async with self._lock:
                         for pc in batch:
@@ -419,12 +437,17 @@ class ConversationManager:
                     yield ToolCallsChunk(batch)
                     return  # park SUSPENDED; subprocess blocked in call_tool
                 elif isinstance(ev, TurnDone):
-                    yield DoneChunk(_finish(ev.stop_reason), usage_from_turn(ev))
+                    # Read usage off the event before closing: _close touches the
+                    # session and bridge, not `ev`, but keeping the extraction
+                    # ahead of teardown makes the ordering obvious.
+                    finish, usage = _finish(ev.stop_reason), usage_from_turn(ev)
                     await self._close(conv)
+                    yield DoneChunk(finish, usage)
                     return
                 elif isinstance(ev, Error):
-                    yield ErrorChunk(ev.message, status_code=502)
+                    message = ev.message
                     await self._close(conv)
+                    yield ErrorChunk(message, status_code=502)
                     return
                 # Init / others: ignore.
         except asyncio.CancelledError:
