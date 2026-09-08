@@ -45,7 +45,7 @@ class Settings(BaseSettings):
 
     # ── Claude CLI ───────────────────────────────────────────────────────────
     claude_bin: str = "claude"
-    default_model: str = "claude-opus-4-8"
+    default_model: str = "claude-opus-5"
     default_effort: str | None = None
     permission_mode: str = "bypassPermissions"
     # Force the CLI to inject tool schemas directly rather than behind a
