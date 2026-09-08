@@ -64,6 +64,7 @@ import hashlib
 import json
 import logging
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -92,6 +93,12 @@ KEY_CONTENT = "content"
 # all real text. Text that *does* contain it is routed through the structured
 # form so the marker cannot be forged — see `_anchor_repr`.
 SEP = "\x1f"
+
+# Ceiling on tracked sessions. Each entry is a UUID plus a 16-char guard (~100
+# bytes), so this is a small cap in absolute terms; the point is that the
+# registry is bounded at all rather than growing for the process lifetime.
+# Eviction only ever costs a cache hit — see SessionRegistry's docstring.
+MAX_TRACKED_SESSIONS = 4096
 
 
 def derive_session_uuid(hermes_session_id: str) -> str:
@@ -271,10 +278,38 @@ class SessionRegistry:
     conversation, so there is nothing to collide and no guard is needed. A
     client that threads a session id therefore keeps reuse across restarts,
     which is the real fix for the cost this policy accepts.
+
+    Bounded on purpose. ``_sessions`` used to grow for the life of the process —
+    one entry per distinct conversation, never removed. It is now an LRU capped
+    at :data:`MAX_TRACKED_SESSIONS`. Eviction is safe in one direction only, and
+    that direction is the safe one: a forgotten UUID makes the next turn re-probe
+    disk, which yields legacy if a file exists (never a blind resume) or a fresh
+    seed if not. Eviction can cost a cache hit; it cannot cause a wrong merge.
     """
 
-    def __init__(self) -> None:
-        self._sessions: dict[str, Optional[str]] = {}
+    def __init__(self, max_tracked: int = MAX_TRACKED_SESSIONS) -> None:
+        # OrderedDict, not dict: entries are moved to the end on every touch so
+        # eviction drops the least-recently-used conversation rather than the
+        # oldest-created one (a long-running conversation must not be evicted
+        # just because it started early).
+        self._sessions: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        self._max_tracked = max(1, max_tracked)
+
+    # ── registry bookkeeping ──────────────────────────────────────────────—
+
+    def _remember(self, session_uuid: str, guard: Optional[str]) -> None:
+        """Record/refresh a session's guard, evicting LRU entries past the cap."""
+        self._sessions[session_uuid] = guard
+        self._sessions.move_to_end(session_uuid)
+        while len(self._sessions) > self._max_tracked:
+            evicted, _ = self._sessions.popitem(last=False)
+            logger.info("reuse: evicting LRU session %s (cap %d)",
+                        evicted, self._max_tracked)
+
+    def _touch(self, session_uuid: str) -> None:
+        """Mark a session as recently used so the LRU keeps it."""
+        if session_uuid in self._sessions:
+            self._sessions.move_to_end(session_uuid)
 
     def plan(
         self,
@@ -310,11 +345,19 @@ class SessionRegistry:
     # ── hsid lane ─────────────────────────────────────────────────────────—
 
     def _plan_hsid(self, session_uuid: str, workdir: Union[str, Path]) -> ReusePlan:
-        if session_uuid in self._sessions or session_exists_on_disk(session_uuid, workdir):
+        # The hsid key is unique per conversation, so an on-disk transcript can
+        # only be this conversation's — disk backfill stays safe on this lane
+        # (unlike the content lane, see _plan_content).
+        if session_uuid in self._sessions:
             self._sessions.setdefault(session_uuid, None)
+            self._touch(session_uuid)
             logger.info("reuse[hsid]: resume %s", session_uuid)
             return ReusePlan(MODE_RESUME, session_uuid, KEY_HSID)
-        self._sessions[session_uuid] = None
+        if session_exists_on_disk(session_uuid, workdir):
+            self._remember(session_uuid, None)
+            logger.info("reuse[hsid]: resume %s", session_uuid)
+            return ReusePlan(MODE_RESUME, session_uuid, KEY_HSID)
+        self._remember(session_uuid, None)
         logger.info("reuse[hsid]: seed %s", session_uuid)
         return ReusePlan(MODE_SEED, session_uuid, KEY_HSID)
 
@@ -340,7 +383,7 @@ class SessionRegistry:
                 logger.info("reuse[content]: opening-turn collision on %s → legacy",
                             session_uuid)
                 return ReusePlan(mode=MODE_LEGACY)
-            self._sessions[session_uuid] = None
+            self._remember(session_uuid, None)
             logger.info("reuse[content]: seed %s", session_uuid)
             return ReusePlan(MODE_SEED, session_uuid, KEY_CONTENT)
 
@@ -368,17 +411,18 @@ class SessionRegistry:
                     session_uuid,
                 )
                 return ReusePlan(mode=MODE_LEGACY)
-            self._sessions[session_uuid] = guard
+            self._remember(session_uuid, guard)
             logger.info("reuse[content]: seed (mid-history) %s", session_uuid)
             return ReusePlan(MODE_SEED, session_uuid, KEY_CONTENT)
 
         stored = self._sessions.get(session_uuid)
         if stored is None:
             # First continuing turn after seeding: capture the guard, resume.
-            self._sessions[session_uuid] = guard
+            self._remember(session_uuid, guard)
             logger.info("reuse[content]: resume (guard captured) %s", session_uuid)
             return ReusePlan(MODE_RESUME, session_uuid, KEY_CONTENT)
         if stored == guard:
+            self._touch(session_uuid)
             logger.info("reuse[content]: resume %s", session_uuid)
             return ReusePlan(MODE_RESUME, session_uuid, KEY_CONTENT)
 
