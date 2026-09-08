@@ -40,11 +40,21 @@ RestartSec=10
 # This limit covers the WHOLE cgroup: uvicorn plus every `claude` subprocess it
 # spawns. It must stay in step with CCI_MAX_CONCURRENT_CONVERSATIONS in the env
 # file, since that cap decides how many children can exist:
-#   8 lanes x ~292 MB anon + ~75 MB uvicorn + ~58 MB slab = ~2.5 GB
-# 3G leaves ~600 MB for page cache. The previous 1500M held only ~4 lanes of
-# anonymous memory, so the cap of 12 could never have been reached -- the cgroup
-# would have OOM-killed first.
-MemoryMax=3G
+#   8 lanes x ~333 MB anon + ~316 MB uvicorn = ~3.0 GB   (measured 2026-09-08)
+# 4G leaves ~1 GB for page cache.
+#
+# Raised 3G -> 4G on 2026-09-08. At 3G a full 8 lanes sat at ~2.99 GB, flush
+# against the ceiling: the cgroup hit memory.max 7279 times with 55348 major
+# faults and measurable swap-in, while oom_kill stayed 0. That failure mode is
+# SILENT -- a constant reclaim tax on every turn, no crash, and nothing in the
+# journal to point at. Check memory.events, not the logs, before trusting this
+# number; the tell is a rising `max` counter.
+#
+# The earlier per-lane figure of ~292 MB (measured 2026-08-25) was optimistic;
+# live lanes run 285-333 MB. Re-measure both values together before changing
+# either. The original 1500M held only ~4 lanes, so the old cap of 12 could
+# never have been reached -- the cgroup would have OOM-killed first.
+MemoryMax=4G
 
 [Install]
 WantedBy=multi-user.target
