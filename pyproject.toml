@@ -17,7 +17,12 @@ dependencies = [
     "httptools>=0.6",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "mcp>=1.2",
+    # Upper bound is load-bearing: mcp 2.0 removes the low-level decorator API
+    # this server is built on -- `@server.list_tools()` and
+    # `@server.call_tool(validate_input=False)` in app/mcp_bridge.py. An
+    # unbounded `mcp>=1.2` lets a fresh `uv sync` resolve to 2.x and fail at
+    # import, which for a systemd unit means the service simply stops starting.
+    "mcp>=1.2,<2",
     "sse-starlette>=2.1",
 ]
 
