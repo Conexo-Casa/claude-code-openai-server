@@ -78,10 +78,12 @@ CCI_PORT=8787
 
 # ── Claude CLI ───────────────────────────────────────────────────────────────
 CCI_CLAUDE_BIN=claude
-CCI_DEFAULT_MODEL=claude-opus-4-8
+CCI_DEFAULT_MODEL=claude-opusplan
 # CCI_DEFAULT_EFFORT=high
 CCI_PERMISSION_MODE=bypassPermissions
 CCI_ENABLE_TOOL_SEARCH=false
+CCI_MAX_CONCURRENT_CONVERSATIONS=16
+CCI_SESSION_REUSE=true
 
 # ── Bare model mode ──────────────────────────────────────────────────────────
 # true (default): strip Claude Code's identity + native tools so it behaves as a
@@ -137,10 +139,12 @@ CCI_TIMING_LOG=false
 | `CCI_PORT` | `8787` | Bind port. Also used to build the per-conversation MCP callback URL. |
 | `CCI_API_KEY` | _(unset)_ | Bearer token required on every `/v1` request when set. Mandatory for a non-loopback bind. |
 | `CCI_CLAUDE_BIN` | `claude` | Path to the `claude` CLI. |
-| `CCI_DEFAULT_MODEL` | `claude-opus-4-8` | Model used when the request names none / an unknown one. |
+| `CCI_DEFAULT_MODEL` | `claude-opusplan` | Model used when the request names none / an unknown one. |
 | `CCI_DEFAULT_EFFORT` | _(unset)_ | Reasoning effort passed to `--effort` (e.g. `high`). |
 | `CCI_PERMISSION_MODE` | `bypassPermissions` | Claude CLI permission mode. |
 | `CCI_ENABLE_TOOL_SEARCH` | `false` | When false, tool schemas are injected directly (always visible) instead of behind tool-search. |
+| `CCI_MAX_CONCURRENT_CONVERSATIONS` | `16` | Cap on concurrent live `claude` subprocesses; must stay in step with the unit's `MemoryMax` (see `claude-code-openai-server.service`). `0` disables the cap. |
+| `CCI_SESSION_REUSE` | `true` | Opt in to Phase 3 cross-turn `--resume` reuse instead of the legacy full-history re-fold. See `docs/CONEXO_NOTES.md`. |
 | `CCI_BARE_MODEL_MODE` | `true` | Strip Claude Code identity + native tools; behave as a plain model. |
 | `CCI_BARE_MODEL_SYSTEM_PROMPT` | `You are a helpful AI assistant.` | Fallback system prompt in bare mode when a request sends none. |
 | `CCI_FLATTEN_MARKDOWN_TABLES` | `true` | Rewrite pipe tables to fenced ASCII. |

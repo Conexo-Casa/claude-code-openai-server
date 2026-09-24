@@ -14,9 +14,10 @@ repo) and `.hermes/plans/2026-07-20_phase3-session-reuse-implementation.md`.
 
 ## Runtime feature flag
 
-Phase 3 is **dark by default**. Behaviour is identical to upstream unless enabled:
+Phase 3 is **on by default** (`session_reuse: bool = True` in `app/config.py`,
+raised from the earlier off-by-default state on 2026-09-24):
 
-    CCI_SESSION_REUSE=1     # opt in to --resume cross-turn reuse (default: off)
+    CCI_SESSION_REUSE=false   # opt back out to the legacy full-history re-fold
 
 The Hermes side must also send a stable per-conversation id as `hermes_session_id`
 in the request body. On the deployed `hermes-suite` container that is provided by the

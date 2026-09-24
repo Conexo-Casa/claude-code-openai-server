@@ -21,6 +21,14 @@ WorkingDirectory=/opt/containers/claude-code-openai-server
 # no-API-key invariant depends on that path being right.
 Environment=HOME=/home/behlers
 
+# systemd's default PATH (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin)
+# does not include ~/.local/bin, which is where `claude` is installed for
+# User=behlers. Without this, uvicorn starts fine but every request fails at
+# spawn time with "cannot spawn claude: claude CLI 'claude' not found on PATH".
+# A user shell's ~/.bashrc PATH export does not apply here -- systemd services
+# don't source shell rc files.
+Environment=PATH=/home/behlers/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+
 # Single source of truth for this service's configuration, matching the
 # /opt/containers/env convention used by the container stacks. systemd reads this
 # as root at unit start, before dropping to User=behlers, so 0640 is sufficient.
@@ -40,21 +48,24 @@ RestartSec=10
 # This limit covers the WHOLE cgroup: uvicorn plus every `claude` subprocess it
 # spawns. It must stay in step with CCI_MAX_CONCURRENT_CONVERSATIONS in the env
 # file, since that cap decides how many children can exist:
-#   8 lanes x ~333 MB anon + ~316 MB uvicorn = ~3.0 GB   (measured 2026-09-08)
-# 4G leaves ~1 GB for page cache.
+#   16 lanes x ~333 MB anon + ~316 MB uvicorn = ~5.6 GB   (per-lane figure
+#   measured 2026-09-08)
+# 8G leaves ~2.4 GB for page cache.
 #
-# Raised 3G -> 4G on 2026-09-08. At 3G a full 8 lanes sat at ~2.99 GB, flush
-# against the ceiling: the cgroup hit memory.max 7279 times with 55348 major
-# faults and measurable swap-in, while oom_kill stayed 0. That failure mode is
-# SILENT -- a constant reclaim tax on every turn, no crash, and nothing in the
-# journal to point at. Check memory.events, not the logs, before trusting this
-# number; the tell is a rising `max` counter.
+# Raised 4G -> 8G on 2026-09-24, alongside the 12 -> 16 lane bump for the move
+# to a 4vCPU/16GB host. Keep the prior history: 3G -> 4G on 2026-09-08 because
+# at 3G a full 8 lanes sat at ~2.99 GB, flush against the ceiling -- the cgroup
+# hit memory.max 7279 times with 55348 major faults and measurable swap-in,
+# while oom_kill stayed 0. That failure mode is SILENT -- a constant reclaim
+# tax on every turn, no crash, and nothing in the journal to point at. Check
+# memory.events, not the logs, before trusting this number; the tell is a
+# rising `max` counter.
 #
 # The earlier per-lane figure of ~292 MB (measured 2026-08-25) was optimistic;
 # live lanes run 285-333 MB. Re-measure both values together before changing
 # either. The original 1500M held only ~4 lanes, so the old cap of 12 could
 # never have been reached -- the cgroup would have OOM-killed first.
-MemoryMax=4G
+MemoryMax=8G
 
 [Install]
 WantedBy=multi-user.target

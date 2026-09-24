@@ -45,7 +45,7 @@ class Settings(BaseSettings):
 
     # ── Claude CLI ───────────────────────────────────────────────────────────
     claude_bin: str = "claude"
-    default_model: str = "claude-opus-5"
+    default_model: str = "claude-opusplan"
     default_effort: str | None = None
     permission_mode: str = "bypassPermissions"
     # Force the CLI to inject tool schemas directly rather than behind a
@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     # during one interactive session). Turns beyond the cap get an OpenAI-shaped
     # 429 and may retry; continuations of an already-live conversation are never
     # refused, since they reuse a subprocess rather than spawning one. 0 disables.
-    max_concurrent_conversations: int = 12
+    max_concurrent_conversations: int = 16
 
     # ── Logging ────────────────────────────────────────────────────────────—
     log_level: str = "INFO"
@@ -123,7 +123,7 @@ class Settings(BaseSettings):
     # legacy fold-everything path. See app/session_reuse.py. Preserves the
     # subscription-auth invariant: every turn still spawns the CLI, which reads
     # the OAuth credential; no API key is ever introduced.
-    session_reuse: bool = False
+    session_reuse: bool = True
 
     @field_validator("default_workdir", mode="before")
     @classmethod
