@@ -41,7 +41,9 @@ Two ways to obtain the per-conversation key, in preference order:
    anchor and we fall back to a safe throwaway fold (:data:`MODE_LEGACY`) rather
    than resume into the wrong session. On the *opening* turn (history length 1)
    we cannot yet tell two identical opens apart, so if the derived session is
-   already seeded we likewise fall back to legacy instead of merging. Net effect:
+   already seeded we likewise fall back to legacy instead of merging — and if the
+   seeder's guard is not captured yet, the session is dropped from the registry
+   so neither chat can later resume into it. Net effect:
    correctness is always preserved; the cache win goes to the first conversation
    with a given opening line, and any collider silently runs exactly like today.
 
@@ -434,8 +436,20 @@ class SessionRegistry:
         # fold (which, for a 1-message history, is just that message).
         if history_len <= 1:
             if known or session_exists_on_disk(session_uuid, workdir):
-                logger.info("reuse[content]: opening-turn collision on %s → legacy",
-                            session_uuid)
+                # If the seeder's guard is not captured yet, the colliding
+                # conversation's second turn would take the "capture guard,
+                # resume" branch below and merge into the seeder's session —
+                # and nothing could tell the two apart. Forget the entry so
+                # every later turn of either chat hits the unverifiable-on-disk
+                # branch → legacy. Once a guard exists, it already rejects the
+                # collider and the seeder keeps resuming (2026-09-25).
+                if known and self._sessions.get(session_uuid) is None:
+                    self.forget(session_uuid)
+                    logger.info("reuse[content]: opening-turn collision on %s "
+                                "before guard → forget, legacy", session_uuid)
+                else:
+                    logger.info("reuse[content]: opening-turn collision on %s → legacy",
+                                session_uuid)
                 return ReusePlan(mode=MODE_LEGACY)
             self._remember(session_uuid, None)
             logger.info("reuse[content]: seed %s", session_uuid)

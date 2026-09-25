@@ -230,6 +230,47 @@ def test_content_opening_turn_collision_is_legacy(monkeypatch):
     assert b1.mode == MODE_LEGACY
 
 
+def test_opening_collision_before_guard_blocks_second_turn_merge(monkeypatch):
+    # Gap left by the divergence guard: B collides on its opening turn while A
+    # has not yet had a follow-up, so A's guard is still uncaptured. B's second
+    # turn then took the "first continuing turn → capture guard, resume" branch
+    # into A's session. After an unguarded collision neither chat can be told
+    # apart, so both must fall back to legacy (2026-09-25).
+    files = _seeded_disk(monkeypatch)
+    reg = SessionRegistry()
+    a1 = reg.plan(None, [_u("status")], "/tmp/wd", enabled=True)
+    assert a1.mode == MODE_SEED
+    files.add(a1.session_uuid)
+    b1 = reg.plan(None, [_u("status")], "/tmp/wd", enabled=True)
+    assert b1.mode == MODE_LEGACY
+    b2 = reg.plan(None, _turn("status", "BBB", "go on"), "/tmp/wd", enabled=True)
+    assert b2.mode == MODE_LEGACY
+    # A cannot prove it is the seeder either — whichever second turn arrives
+    # first would otherwise win the session. It stays on legacy too.
+    a2 = reg.plan(None, _turn("status", "AAA", "go on"), "/tmp/wd", enabled=True)
+    assert a2.mode == MODE_LEGACY
+    b3 = reg.plan(None, _turn("status", "BBB", "go on", "ok", "more"),
+                  "/tmp/wd", enabled=True)
+    assert b3.mode == MODE_LEGACY
+
+
+def test_opening_collision_after_guard_keeps_seeder_resuming(monkeypatch):
+    # Once A's guard is captured, a later opening-turn collision is harmless:
+    # the guard already rejects B, so A must keep its cache win.
+    files = _seeded_disk(monkeypatch)
+    reg = SessionRegistry()
+    a1 = reg.plan(None, [_u("status")], "/tmp/wd", enabled=True)
+    files.add(a1.session_uuid)
+    assert reg.plan(None, _turn("status", "AAA", "go on"), "/tmp/wd",
+                    enabled=True).mode == MODE_RESUME
+    assert reg.plan(None, [_u("status")], "/tmp/wd", enabled=True).mode == MODE_LEGACY
+    assert reg.plan(None, _turn("status", "BBB", "go on"), "/tmp/wd",
+                    enabled=True).mode == MODE_LEGACY
+    a3 = reg.plan(None, _turn("status", "AAA", "go on", "ok", "more"),
+                  "/tmp/wd", enabled=True)
+    assert a3.mode == MODE_RESUME
+
+
 def test_content_divergence_guard_blocks_merge(monkeypatch):
     # Two chats share the opening line but diverge at the first reply → the
     # second must fall back to legacy, never resume into the first's session.
