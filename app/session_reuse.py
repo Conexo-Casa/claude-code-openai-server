@@ -356,6 +356,7 @@ class SessionRegistry:
         workdir: Union[str, Path],
         *,
         enabled: bool,
+        has_tools: bool = True,
     ) -> ReusePlan:
         """Decide seed/resume/legacy for a fresh turn.
 
@@ -363,6 +364,19 @@ class SessionRegistry:
         feature is off, no key can be derived, or a content-anchor collision is
         detected — so the feature is a strict superset and off-by-default is
         byte-for-byte the old path.
+
+        ``has_tools=False`` (the autonomous path) keeps the hsid lane but never
+        enters the content lane. hermes' title generator is a tool-less side
+        call with no session id whose history is the chat's opening message, so
+        it derived the *same* content anchor as the chat and seeded a session
+        under the title prompt. The chat's first follow-up turn that lacked a
+        session id then took the "first continuing turn → capture guard,
+        resume" branch into that title session, and every answer came back as
+        ``{"title": ...}`` (2026-09-25). The guard cannot catch it: the title
+        session was seeded with no reply, so there was nothing to compare.
+        The cost is nil: the journal from 2026-09-24 03:12 to 09-25 shows 58
+        tool-less content seeds and zero tool-less content resumes — hermes
+        chat turns carry tools, so only side calls ever landed here.
         """
         if not enabled:
             return ReusePlan(mode=MODE_LEGACY)
@@ -372,6 +386,8 @@ class SessionRegistry:
             return self._plan_hsid(derive_session_uuid(hermes_session_id), workdir)
 
         # ── fallback: derive a stable key from conversation content
+        if not has_tools:
+            return ReusePlan(mode=MODE_LEGACY)
         anchor = content_anchor(convo)
         if not anchor:
             return ReusePlan(mode=MODE_LEGACY)

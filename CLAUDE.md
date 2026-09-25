@@ -134,7 +134,8 @@ reference copy, **not** what systemd reads, and it drifts from the installed fil
 before trusting either, and sync deliberately after editing the installed one.
 
 Phase 3 session reuse is gated by `CCI_SESSION_REUSE` and needs hermes to send a stable
-`hermes_session_id` in the request body; without it the wrapper falls back to
-content-fingerprint keying with a divergence guard. `CCI_MAX_CONCURRENT_CONVERSATIONS` and
+`hermes_session_id` in the request body; without it, **tooled** requests fall back to
+content-fingerprint keying with a divergence guard, and tool-less (autonomous) requests
+run legacy — see `SessionRegistry.plan`'s `has_tools` note. `CCI_MAX_CONCURRENT_CONVERSATIONS` and
 `CCI_SESSION_REUSE` are live in the deployed env file but absent from the README's config
 table — `app/config.py` is the source of truth for defaults.

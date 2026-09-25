@@ -179,6 +179,45 @@ def test_content_seed_then_resume_across_turns(monkeypatch):
     assert t3.mode == MODE_RESUME and t3.session_uuid == t1.session_uuid
 
 
+def test_toolless_request_never_enters_content_lane(monkeypatch):
+    # The title-generator side call: no tools, no hsid. It must not seed a
+    # content session, on the opening turn or any later one.
+    files = _seeded_disk(monkeypatch)
+    reg = SessionRegistry()
+    t1 = reg.plan(None, [_u("do a health check")], "/tmp/wd",
+                  enabled=True, has_tools=False)
+    assert t1.mode == MODE_LEGACY and t1.session_uuid is None
+    t2 = reg.plan(None, _turn("do a health check", "ok", "next"), "/tmp/wd",
+                  enabled=True, has_tools=False)
+    assert t2.mode == MODE_LEGACY
+    assert not files and not reg._sessions
+
+
+def test_toolless_request_keeps_hsid_lane(monkeypatch):
+    _seeded_disk(monkeypatch)
+    reg = SessionRegistry()
+    plan = reg.plan("hsid-auto", [_u("hi")], "/tmp/wd",
+                    enabled=True, has_tools=False)
+    assert plan.mode == MODE_SEED and plan.key_source == KEY_HSID
+
+
+def test_title_call_cannot_capture_chat_turn(monkeypatch):
+    # Regression, 2026-09-25: a tool-less title call seeded a content session
+    # on the chat's opening message; the chat's later tooled turn that arrived
+    # without an hsid resumed into it and was answered as {"title": ...}.
+    files = _seeded_disk(monkeypatch)
+    reg = SessionRegistry()
+    title = reg.plan(None, [_u("update complete. do health check")], "/tmp/wd",
+                     enabled=True, has_tools=False)
+    if title.session_uuid:
+        files.add(title.session_uuid)
+    chat = reg.plan(None, _turn("update complete. do health check",
+                                "health report", "ok, can you do 1."),
+                    "/tmp/wd", enabled=True, has_tools=True)
+    assert chat.mode != MODE_RESUME
+    assert chat.session_uuid is None or chat.session_uuid != title.session_uuid
+
+
 def test_content_opening_turn_collision_is_legacy(monkeypatch):
     # A *different* conversation opens with the identical first line while the
     # first is already seeded → must NOT resume into it.

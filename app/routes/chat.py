@@ -85,7 +85,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # send ONLY the new user turn (the CLI already holds the prior context on
     # disk); otherwise we fold the whole transcript as before.
     registry = request.app.state.session_registry
-    plan = registry.plan(req.hermes_session_id, convo, workdir, enabled=settings.session_reuse)
+    plan = registry.plan(
+        req.hermes_session_id, convo, workdir,
+        enabled=settings.session_reuse, has_tools=False,
+    )
     if plan.mode == MODE_RESUME:
         content = turn_delta(convo)
     else:
